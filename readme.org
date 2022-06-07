@@ -1,0 +1,11 @@
+#+TITLE: github-actions
+
+A small library to work with the github actions api.
+See documentation for more info.
+
+* Installation
+: raco pkg install https://github.com/LLazarek/github-actions
+
+* Documentation
+: raco docs github-actions
+
