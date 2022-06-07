@@ -1,62 +1,72 @@
 #lang at-exp racket
 
-(provide get-all-runs!
-         get-runs-by-url!
-         get-run-by-url!
-         cancel-run!
-         launch-run!
-         get-run-log!
-         (struct-out ci-run))
+(provide
+ (contract-out
+  [launch-run! (string?
+                string?
+                string?
+                string?
+                . -> .
+                (either/c actions-run?))]
+  [cancel-run! (actions-run? . -> . boolean?)]
+  [get-run-log! ({actions-run?}
+                 {#:section (or/c string? #f)}
+                 . ->* .
+                 (either/c string?))]
+
+  [get-all-runs! (string? string? . -> . (either/c (listof actions-run?)))]
+  [get-run-by-url! (string? . -> . (either/c actions-run?))]
+
+  ;; undocumented, bc there's no point until `get-all-runs!` is fixed
+  [get-runs-by-url! (string?
+                     string?
+                     (listof string?)
+                     . -> . (either/c (hash/c string? (either/c actions-run?))))])
+ (struct-out actions-run))
 
 (require "github-api.rkt"
          simple-option/either
          gregor
          file/unzip)
 
-(struct ci-run (id
-                url
-                html-url
-                commit
-                status
-                conclusion
-                creation-time
-                log-url
-                cancel-url)
+(struct actions-run (id
+                     url
+                     html-url
+                     commit
+                     status
+                     conclusion
+                     creation-time
+                     log-url
+                     cancel-url)
   #:prefab)
 
-;; lltodo: this doesn't deal with pagination
-(define/contract (get-all-runs! repo-owner repo-name)
-  (string? string? . -> . (either/c (listof ci-run?)))
-
+;; todo: this doesn't deal with pagination
+(define (get-all-runs! repo-owner repo-name)
   (either-let*
    ([run-info (github-request! (~a "repos/" repo-owner "/" repo-name "/actions/runs"))]
     [runs (hash-ref/either run-info
                            'workflow_runs
                            @~a{Failed to get runs: @run-info})])
-   (map json->ci-run runs)))
+   (map json->actions-run runs)))
 
-(define/contract (get-runs-by-url! repo-owner repo-name urls)
-  (string? string? (listof string?) . -> . (either/c (hash/c string? (either/c ci-run?))))
-
-  ;; Alternative version that (probably) more efficiently uses api calls, but
-  ;; needs to deal with pagination
+(define (get-runs-by-url! repo-owner repo-name urls)
+  ;; todo: Alternative version that more efficiently uses api calls, but
+  ;; requires `get-all-runs!` to deal with pagination
   #;(either-let*
      ([all-runs (get-all-runs! repo-owner repo-name)]
       [runs-by-url (for/hash ([run (in-list all-runs)])
-                     (values (ci-run-url run) run))])
+                     (values (actions-run-url run) run))])
      (for/hash ([url (in-list urls)])
        (values url
                (hash-ref/option runs-by-url url @~a{No run found with url @url}))))
   (for/hash ([url (in-list urls)])
     (values url (get-run-by-url! url))))
 
-(define/contract (get-run-by-url! url)
-  (string? . -> . (either/c ci-run?))
-
+(define (get-run-by-url! url)
   (either-let*
    ([run-json (github-request! url)
               #:extra-failure-message (~a url " : ")])
-   (json->ci-run run-json)))
+   (json->actions-run run-json)))
 
 (define (failed-to action code headers in)
   (failure
@@ -65,7 +75,7 @@
        Message: @(try-read-body-string code headers in)
        }))
 
-(define (json->ci-run run-info-json)
+(define (json->actions-run run-info-json)
   (match run-info-json
     [(hash-table ['id id]
                  ['url url]
@@ -77,40 +87,31 @@
                  ['logs_url log-url]
                  ['cancel_url cancel-url]
                  _ ...)
-     (ci-run id
-             url
-             html-url
-             commit
-             status
-             conclusion
-             (iso8601->moment creation-time)
-             log-url
-             cancel-url)]
+     (actions-run id
+                  url
+                  html-url
+                  commit
+                  status
+                  conclusion
+                  (iso8601->moment creation-time)
+                  log-url
+                  cancel-url)]
     [else (failure "Unexpected run info shape in api response")]))
 
-(define/contract (cancel-run! a-run)
-  (ci-run? . -> . boolean?)
-
-  (github-request! (ci-run-cancel-url a-run)
+(define (cancel-run! a-run)
+  (github-request! (actions-run-cancel-url a-run)
                    #:method POST
                    #:read-response (λ (code headers in) (equal? code 202))))
 
 (define run-retrieval-polling-period-seconds 5)
 (define run-retrieval-polling-timeout-seconds (* 1 60))
 
-(define/contract (launch-run! repo-owner repo-name workflow-id ref)
-  (string?
-   string?
-   string?
-   string?
-   . -> .
-   (either/c ci-run?))
-
-  (define (ci-run-newer? run1 run2)
-    (moment>? (ci-run-creation-time run1)
-              (ci-run-creation-time run2)))
+(define (launch-run! repo-owner repo-name workflow-id ref)
+  (define (actions-run-newer? run1 run2)
+    (moment>? (actions-run-creation-time run1)
+              (actions-run-creation-time run2)))
   (define (newest-job-in jobs)
-    (match (sort jobs ci-run-newer?)
+    (match (sort jobs actions-run-newer?)
       [(cons newest _) newest]
       ['() #f]))
   (define (wait/poll-for-new-job! original-jobs)
@@ -118,7 +119,7 @@
      ([original-latest-job
        (let loop ([retry-count 0])
          (match (newest-job-in original-jobs)
-           [(? ci-run? a-job) a-job]
+           [(? actions-run? a-job) a-job]
            [else
             #:when (< (* retry-count run-retrieval-polling-period-seconds)
                       run-retrieval-polling-timeout-seconds)
@@ -133,7 +134,7 @@
          (match (get-all-runs! repo-owner repo-name)
            [(and (not (? failure?))
                  (app newest-job-in latest-job))
-            #:when (ci-run-newer? latest-job original-latest-job)
+            #:when (actions-run-newer? latest-job original-latest-job)
             latest-job]
            [else
             #:when (< (* retry-count run-retrieval-polling-period-seconds)
@@ -164,12 +165,7 @@
 
 (define wget (find-executable-path "wget"))
 
-(define/contract (get-run-log! a-run #:section [section-name #f])
-  ({ci-run?}
-   {#:section (or/c string? #f)}
-   . ->* .
-   (either/c string?))
-
+(define (get-run-log! a-run #:section [section-name #f])
   (define (url->log-contents log-download-url)
     (with-handlers ([exn:fail? (λ (e) (failure @~a{Error raised while getting log: @(exn-message e)}))])
       (match-define (list stdout stdin _ stderr ctl)
@@ -210,7 +206,7 @@
 
   (either-let*
    ([log-download-url (github-request!
-                       (ci-run-log-url a-run)
+                       (actions-run-log-url a-run)
                        #:read-response (match-lambda**
                                         [{302 (regexp #rx"(?mi:^location: (.+?)$)" (list _ url)) _}
                                          url]
